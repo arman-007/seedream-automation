@@ -2,112 +2,272 @@ import argparse
 import os
 import time
 import requests
+import base64
+import re
 from playwright.sync_api import sync_playwright
 
 def download_image(url, save_path):
     print(f"Downloading image from {url}...")
-    response = requests.get(url, stream=True)
-    if response.status_code == 200:
-        with open(save_path, 'wb') as f:
-            for chunk in response.iter_content(1024):
-                f.write(chunk)
-        print(f"Image saved to {save_path}")
-        return True
-    else:
-        print(f"Failed to download image. Status code: {response.status_code}")
+    try:
+        response = requests.get(url, stream=True, timeout=30)
+        if response.status_code == 200:
+            with open(save_path, 'wb') as f:
+                for chunk in response.iter_content(1024):
+                    f.write(chunk)
+            print(f"Image saved to {save_path}")
+            return True
+        else:
+            print(f"Failed to download image. Status code: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"Error downloading image: {e}")
         return False
 
-def generate_image(image_path, prompt, output_path="generated_image.png"):
+def read_master_prompt(file_path="MASTER_PROMPT.txt"):
+    try:
+        with open(file_path, "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        print(f"Warning: {file_path} not found.")
+        return ""
+
+def generate_image(image_path, prompt, output_path="result.png", style="Photo", mode="General"):
+    print("Launching browser...")
     with sync_playwright() as p:
-        # Launch browser (headless=False for debugging visibility, can serve headless later)
-        browser = p.chromium.launch(headless=False) 
+        browser = p.chromium.launch(headless=True)
+        
+        # Load state if exists
         if os.path.exists("state.json"):
-            print("Using saved session state.")
+            print("Loading session state...")
             context = browser.new_context(storage_state="state.json")
         else:
-            print("No session state found. Running without login (might fail).")
+            print("Warning: state.json not found. Logging in might be required.")
             context = browser.new_context()
+            
         page = context.new_page()
 
-        try:
-            print("Navigating to Seedream...")
-            page.goto("https://seedream.pro/ai-photo-editor")
+        # Subscribe to console events
+        page.on("console", lambda msg: print(f"Browser Console: {msg.text}"))
 
-            # Scroll to generator section to ensure elements are interactive
-            print("Scrolling to generator...")
-            # Try to find the generator anchor or just scroll down
-            try:
-                page.click('a[href="#generator"]', timeout=5000)
-            except:
-                print("Could not click anchor, scrolling manually...")
-                page.mouse.wheel(0, 1000)
+        try:
+            print("Navigating to Seedream Editor...")
+            page.goto("https://seedream.pro/ai-photo-editor", timeout=60000)
             
-            # Locate file input
-            print("Uploading image...")
+            # 1. Upload Image
+            print(f"Uploading image: {image_path}")
+            # The input file is often hidden, so we set input files directly on the locator
             file_input = page.locator('input[type="file"]')
+            file_input.wait_for(state="attached") 
             file_input.set_input_files(image_path)
             
-            # Wait for upload processing if necessary (look for image preview or similar change)
-            # For now, just a small sleep or check for the prompt area to be active/visible
-            page.wait_for_timeout(2000)
+            # Wait for upload to react (preview appears or prompt becomes interactive)
+            page.wait_for_timeout(5000)
+            page.screenshot(path="run_debug_1_after_upload.png")
+            print(f"After upload URL: {page.url}")
 
-            # Enter prompt
-            print(f"Entering prompt: {prompt[:50]}...")
-            # The analyze step found a textarea. We'll target it specifically.
+            # 2. Select Style Preset
+            print(f"Selecting Style Preset: {style}")
+            style_locator = page.locator(f'div:text-is("{style}"), button:has-text("{style}")').first
+            try:
+                style_locator.wait_for(state="visible", timeout=10000)
+                style_locator.click(force=True)
+            except Exception as e:
+                print(f"Warning: Failed to select {style} preset: {e}")
+                page.screenshot(path=f"debug_failed_{style}_selection.png")
+
+            # 3. Select Edit Mode
+            print(f"Selecting Edit Mode: {mode}")
+            mode_locator = page.locator(f'div:text-is("{mode}"), button:has-text("{mode}")').first
+            try:
+                mode_locator.wait_for(state="visible", timeout=10000)
+                mode_locator.click(force=True)
+            except Exception as e:
+                print(f"Warning: Failed to select {mode} edit mode: {e}")
+                page.screenshot(path=f"debug_failed_{mode}_selection.png")
+
+            # 4. Enter Prompt
+            print(f"Entering prompt (length: {len(prompt)} chars)...")
             textarea = page.locator('textarea')
+            textarea.wait_for(state="visible")
             textarea.fill(prompt)
+            
+            page.screenshot(path="run_debug_2_before_apply.png")
 
-            # Click Generate / Apply Edits
+            # 5. Click Apply Edits
             print("Clicking 'Apply Edits'...")
             apply_button = page.locator('button:has-text("Apply Edits")')
-            apply_button.click()
+            if apply_button.count() > 0:
+                # Force click to bypass potential overlays
+                apply_button.click(force=True)
+            else:
+                print("CRITICAL: Apply Edits button NOT FOUND!")
+                page.screenshot(path="debug_no_apply_button.png")
 
-            # Wait for generation to complete
-            # We need to look for the result image. 
-            # Usually these sites show a loading spinner then replace it with the image.
-            print("Waiting for generation...")
-            # Wait for some time or a specific element change. 
-            # Since we don't know the exact success selector yet, we'll wait for a new image source 
-            # or a specific 'Download' button that appears after generation.
+            # Check state immediate after click
+            page.wait_for_timeout(5000)
+            print(f"After apply URL: {page.url}")
+            page.screenshot(path="run_debug_3_after_apply.png")
+
+            # 6. Wait for Generation & Download
+            print("Waiting for generation to complete...")
             
-            # Heuristic: Wait for the "Download" button to appear or become enabled
-            try:
-                download_button = page.locator('button:has-text("Download")', has_text="Download").first
-                download_button.wait_for(state="visible", timeout=60000) # 60s timeout for generation
-                print("Generation complete!")
+            # We wait for either the Download button (success) or an error modal (failure)
+            # The "Edit Failed" modal often appears with "High demand right now"
+            error_locator = page.locator('div:has-text("Edit Failed"), div:has-text("High demand right now")')
+            download_locator = page.locator('button:has-text("Download")')
+            
+            start_time = time.time()
+            generation_success = False
+            
+            while time.time() - start_time < 120:  # 2 minute total timeout
+                if error_locator.first.is_visible():
+                    print("DETECTED: Edit Failed modal!")
+                    error_text = error_locator.first.inner_text()
+                    print(f"Error details: {error_text.replace('\n', ' ')}")
+                    page.screenshot(path="run_debug_edit_failed.png")
+                    
+                    # Try to close the modal and maybe we could retry, but for now we exit
+                    close_button = page.locator('button:has-text("✕"), .modal-close, [aria-label="Close"]').first
+                    if close_button.count() > 0:
+                        print("Attempting to close error modal...")
+                        close_button.click()
+                    
+                    raise Exception(f"Generation failed on website: {error_text}")
                 
-                # Click download or extract image src
-                # If clicking download triggers a download event:
-                with page.expect_download() as download_info:
-                    download_button.click()
+                if download_locator.first.is_visible():
+                    # Ensure it's not a background button if possible
+                    # On some pages, the download button might be hidden until result is ready
+                    print("Generation complete! (Download button visible)")
+                    generation_success = True
+                    break
+                
+                page.wait_for_timeout(2000)
+            
+            if not generation_success:
+                page.screenshot(path="run_debug_generation_timeout.png")
+                raise TimeoutError("Generation timed out - neither download button nor error modal appeared in 120s")
+            
+            download_button = download_locator.first
+            
+            # Debug: List all images
+            images = page.eval_on_selector_all("img", "elements => elements.map(e => e.src)")
+            print("Found images:", images)
+
+            # Debug: what is this button?
+            print(f"Download button HTML: {download_button.evaluate('el => el.outerHTML')}")
+
+            try:
+                # Setup download handler
+                print("Attempting to click download button...")
+                with page.expect_download(timeout=30000) as download_info:
+                    # Sometimes clicking the download button triggers the download
+                    # Try to click the first visible download button
+                    download_button.click(force=True)
                 
                 download = download_info.value
                 download.save_as(output_path)
-                print(f"Saved generated image to {output_path}")
-
+                print(f"Saved generated image to {os.path.abspath(output_path)}")
             except Exception as e:
-                print(f"Error waiting for result: {e}")
-                # Fallback: Take a screenshot if download fails
-                page.screenshot(path="debug_error.png")
-                print("Saved debug_error.png")
+                print(f"Direct download failed or timed out: {e}")
+                print("Checking for alternative download buttons or modals...")
+                page.screenshot(path="run_debug_after_click.png")
+                
+                # Check for "Download Image" or similar inside a modal
+                # Common patterns: "Download HD", "Download Original", etc.
+                modal_download = page.locator('button:has-text("Download Image"), a:has-text("Download Image"), button:has-text("Download High Res")').first
+                if modal_download.count() > 0:
+                     print(f"Found modal option: {modal_download.evaluate('el => el.innerText')}")
+                     with page.expect_download(timeout=30000) as download_info:
+                        modal_download.click(force=True)
+                     download = download_info.value
+                     download.save_as(output_path)
+                     print(f"Saved generated image (from modal) to {os.path.abspath(output_path)}")
+                else:
+                    print("No modal download option found.")
+                    
+                    # FALLBACK: Try to find the image in the page as a base64 string
+                    print("Attempting fallback: searching for base64 image data...")
+                    image_elements = page.query_selector_all("img")
+                    found_fallback = False
+                    for img in image_elements:
+                        src = img.get_attribute("src")
+                        if not src: continue
+                        
+                        # Case 1: Base64
+                        if src.startswith("data:image/"):
+                            # If it's a large image (likely the result)
+                            if len(src) > 50000: # >50KB
+                                print(f"Found potential result image (base64, size: {len(src)})")
+                                # Extract data
+                                try:
+                                    header, data = src.split(",", 1)
+                                    with open(output_path, "wb") as f:
+                                        f.write(base64.b64decode(data))
+                                    print(f"Saved generated image from base64 string to {os.path.abspath(output_path)}")
+                                    found_fallback = True
+                                    break
+                                except Exception as b64e:
+                                    print(f"Failed to decode base64 image: {b64e}")
+                        
+                        # Case 2: Static result URL (e.g. static.seedream.pro/.../output/...)
+                        elif "seedream.pro" in src and "/output/" in src:
+                            print(f"Found potential result image (URL: {src})")
+                            if download_image(src, output_path):
+                                print(f"Saved generated image from URL to {os.path.abspath(output_path)}")
+                                found_fallback = True
+                                break
+                    
+                    if not found_fallback:
+                        # Dump HTML
+                        with open("debug_page.html", "w") as f:
+                            f.write(page.content())
+                        raise e
 
         except Exception as e:
-            print(f"An error occurred: {e}")
-            page.screenshot(path="debug_exception.png")
+            print(f"Error during generation: {e}")
+            page.screenshot(path="run_debug_generation_error.png")
+            print("Saved debug_generation_error.png")
+            
+            # Dump HTML and Images on failure
+            try:
+                images = page.eval_on_selector_all("img", "elements => elements.map(e => e.src)")
+                print("Found images (on failure):", images)
+                with open("debug_page_failure.html", "w") as f:
+                    f.write(page.content())
+                print("Saved debug_page_failure.html")
+            except Exception as dump_e:
+                print(f"Failed to dump debug info: {dump_e}")
         finally:
             browser.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Seedream AI Image Generator Automation")
-    parser.add_argument("--url", required=True, help="URL of the input image")
-    parser.add_argument("--prompt", required=True, help="Prompt for image generation")
+    parser.add_argument("--url", help="URL of the input image")
+    parser.add_argument("--file", help="Path to local input image")
+    parser.add_argument("--prompt-file", default="MASTER_PROMPT.txt", help="Path to prompt file")
     parser.add_argument("--output", default="result.png", help="Output filename")
-
+    parser.add_argument("--style", default="Photo", help="Style preset to apply")
+    parser.add_argument("--mode", default="General", help="Edit mode to use")
+    
     args = parser.parse_args()
+    
+    # Prioritize reading prompt from file
+    prompt_text = read_master_prompt(args.prompt_file)
+    if not prompt_text:
+        print("Error: Empty prompt or file not found. Please check MASTER_PROMPT.txt")
+        exit(1)
 
-    temp_image = "temp_input.jpg"
-    if download_image(args.url, temp_image):
-        generate_image(temp_image, args.prompt, args.output)
-        # Cleanup
-        if os.path.exists(temp_image):
-            os.remove(temp_image)
+    if args.file:
+        if os.path.exists(args.file):
+            generate_image(args.file, prompt_text, args.output, args.style, args.mode)
+        else:
+            print(f"Error: File {args.file} not found.")
+    elif args.url:
+        temp_image = "temp_input.png"
+        if download_image(args.url, temp_image):
+            generate_image(temp_image, prompt_text, args.output, args.style, args.mode)
+            # Cleanup
+            if os.path.exists(temp_image):
+                os.remove(temp_image)
+    else:
+        print("Error: Must provide either --url or --file")
