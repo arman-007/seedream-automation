@@ -1,2 +1,7 @@
 venv/
 .env
+output/
+__pycache__/
+*.png
+state.json
+debug_*.html
