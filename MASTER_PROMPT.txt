@@ -1,8 +1,9 @@
-MASTER_PROMPT = """Retouch the face naturally and smooth the skin without losing details
-Expand the image on all sides with realistic continuation
-ultra detailed stylized portrait of a professional football player, chest-up, centered, facing camera, wearing a modern football jersey in team colors with clean badge and realistic fabric folds,
+Retouch the face naturally and smooth the skin without losing details,
+ultra detailed stylized close-up headshot, face only, centered, facing camera,
+do not expand the image, do not add shoulders, do not add clothing or jersey, do not add any body parts below the neck,
+crop tightly to head and face only,
 preserve exact facial features from input image, preserve skin tone, preserve hairstyle, preserve facial proportions and likeness,
 symmetrical face, realistic anatomy, sharp jawline, natural eyes,
 stylized vector illustration, bold clean outlines, cel shading, smooth gradients, flat vibrant colors, high contrast lighting,
 studio lighting, soft shadows, subtle rim light around silhouette, minimal solid background with gentle gradient,
-graphic novel style, sports poster style, esports card style, crisp edges, highly polished digital art, 4k"""
+graphic novel style, sports poster style, esports card style, crisp edges, highly polished digital art, 4k
