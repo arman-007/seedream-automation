@@ -29,7 +29,8 @@ def get_mongo_client(
                 serverSelectionTimeoutMS=server_selection_timeout_ms,
             )
             client.admin.command("ping")
-            logger.info(f"DB connected to {uri}")
+            safe_uri = uri.split("@")[-1] if "@" in uri else uri
+            logger.info(f"DB connected to {safe_uri}")
             return client
         except ConnectionFailure as e:
             logger.warning(
@@ -57,9 +58,18 @@ def get_source_db():
 def get_tracking_db():
     """
     Returns (MongoClient, Database) for the tracking database.
-    Reads TRACKING_DB_URL and TRACKING_DB_NAME from environment.
+    Reads TRACKING_DB_URL, TRACKING_DB_NAME, and optionally
+    TRACKING_DB_USER / TRACKING_DB_PASSWORD from environment.
+    Credentials are injected into the URI if provided.
     """
     uri = os.getenv("TRACKING_DB_URL", "mongodb://localhost:27017")
     db_name = os.getenv("TRACKING_DB_NAME", "seedream_tracking")
+
+    user = os.getenv("TRACKING_DB_USER")
+    password = os.getenv("TRACKING_DB_PASSWORD")
+    if user and password:
+        # Inject credentials: mongodb://user:pass@host:port
+        uri = uri.replace("mongodb://", f"mongodb://{user}:{password}@", 1)
+
     client = get_mongo_client(uri)
     return client, client[db_name]

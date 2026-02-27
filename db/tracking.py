@@ -35,6 +35,15 @@ def get_completed_player_ids(collection):
     return {doc["api_player_id"] for doc in cursor}
 
 
+def get_failed_player_ids(collection):
+    """Return set of api_player_ids with status == 'failed'."""
+    cursor = collection.find(
+        {"status": STATUS_FAILED},
+        {"api_player_id": 1, "_id": 0},
+    )
+    return {doc["api_player_id"] for doc in cursor}
+
+
 def create_pending_record(collection, api_player_id, source_image_url, style, mode):
     """
     Insert or update a tracking document to 'pending' status.
@@ -57,6 +66,7 @@ def create_pending_record(collection, api_player_id, source_image_url, style, mo
                 "error_log": [],
                 "output_path": None,
                 "generation_duration_seconds": None,
+                "spaces_url": None,
             },
         },
         upsert=True,
@@ -80,18 +90,19 @@ def mark_processing(collection, api_player_id):
     )
 
 
-def mark_completed(collection, api_player_id, output_path, duration_seconds):
-    """Set status to 'completed', record output_path and duration."""
+def mark_completed(collection, api_player_id, output_path, duration_seconds, spaces_url=None):
+    """Set status to 'completed', record output_path, duration, and spaces_url."""
+    fields = {
+        "status": STATUS_COMPLETED,
+        "output_path": output_path,
+        "generation_duration_seconds": duration_seconds,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if spaces_url is not None:
+        fields["spaces_url"] = spaces_url
     collection.update_one(
         {"api_player_id": api_player_id},
-        {
-            "$set": {
-                "status": STATUS_COMPLETED,
-                "output_path": output_path,
-                "generation_duration_seconds": duration_seconds,
-                "updated_at": datetime.now(timezone.utc),
-            }
-        },
+        {"$set": fields},
     )
 
 
@@ -120,3 +131,27 @@ def get_failed_players(collection, max_retries=3):
         "retry_count": {"$lt": max_retries},
     })
     return list(cursor)
+
+
+def reset_stuck_processing(collection):
+    """
+    Reset any records stuck in 'processing' state back to 'failed'.
+    This recovers from a previous pipeline run that crashed mid-execution.
+    """
+    result = collection.update_many(
+        {"status": STATUS_PROCESSING},
+        {
+            "$set": {
+                "status": STATUS_FAILED,
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$inc": {"retry_count": 1},
+            "$push": {"error_log": "Interrupted: found in processing state at pipeline startup"},
+        },
+    )
+    if result.modified_count:
+        logger.warning(
+            f"Reset {result.modified_count} stuck 'processing' record(s) to 'failed'"
+        )
+    else:
+        logger.debug("No stuck processing records found.")
