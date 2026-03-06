@@ -4,4 +4,6 @@ output/
 __pycache__/
 *.png
 state.json
+state_*.json
+accounts.txt
 debug_*.html

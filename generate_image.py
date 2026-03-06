@@ -6,6 +6,11 @@ import base64
 import re
 from playwright.sync_api import sync_playwright
 
+
+class DailyLimitReachedException(Exception):
+    """Raised when a Seedream account has hit its daily generation limit."""
+    pass
+
 def download_image(url, save_path):
     print(f"Downloading image from {url}...")
     try:
@@ -141,6 +146,8 @@ def run_generation_on_page(page, image_path, prompt, output_path, style="Photo",
                 print("Attempting to close error modal...")
                 close_button.click()
 
+            if "today's limit" in error_text.lower() or "daily limit" in error_text.lower():
+                raise DailyLimitReachedException(f"Generation failed on website: {error_text}")
             raise Exception(f"Generation failed on website: {error_text}")
 
         if download_locator.first.is_visible():
