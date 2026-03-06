@@ -4,8 +4,9 @@ import logging
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
-from generate_image import run_generation_on_page, check_session, read_master_prompt
-from login_helper import login_and_save_state
+from generate_image import run_generation_on_page, check_session, read_master_prompt, DailyLimitReachedException
+from login_helper import login_and_save_state, login_with_browser
+from accounts import AccountManager
 from db.connection import get_source_db, get_tracking_db
 from db.source import get_all_players, get_players_by_ids
 from db.tracking import (
@@ -56,18 +57,21 @@ def run_pipeline(
         logger.error(f"Empty prompt or file not found: {prompt_file}")
         return {"error": "Empty prompt"}
 
-    # 1. Validate session — auto-login if expired
-    logger.info("Checking Seedream session...")
-    if not check_session():
+    # 1. Load accounts and validate session for the starting account
+    account_manager = AccountManager()
+    account = account_manager.current
+    state_path = account_manager.state_path
+
+    logger.info(f"Checking Seedream session for {account['email']}...")
+    if not check_session(state_path):
         logger.warning("Session expired or missing. Attempting automatic login...")
-        if not login_and_save_state():
+        if not login_and_save_state(state_path, email=account["email"], password=account["password"]):
             logger.error(
-                "Automatic login failed. "
-                "Check EMAIL/PASSWORD in .env and verify the account is accessible."
+                f"Automatic login failed for {account['email']}. "
+                "Check ACCOUNT_1_EMAIL / ACCOUNT_1_PASSWORD in .env."
             )
             return {"error": "Login failed"}
-        # Re-check after login
-        if not check_session():
+        if not check_session(state_path):
             logger.error("Session still invalid after login attempt.")
             return {"error": "Session invalid after login"}
         logger.info("Auto-login succeeded.")
@@ -157,14 +161,17 @@ def run_pipeline(
         failed = 0
 
         # 4. Launch one browser for the entire batch
-        state_path = "state.json"
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
-                storage_state=state_path if os.path.exists(state_path) else None
+                storage_state=account_manager.state_path if os.path.exists(account_manager.state_path) else None
             )
+            all_exhausted = False
             try:
                 for i, player in enumerate(work_list, 1):
+                    if all_exhausted:
+                        break
+
                     pid = player.get("api_player_id")
                     image_url = player.get("image", "")
                     player_name = player.get("display_name") or player.get("name", "Unknown")
@@ -172,52 +179,111 @@ def run_pipeline(
                     logger.info(f"[{i}/{len(work_list)}] Processing player {pid} ({player_name})")
                     start_time = time.time()
 
-                    page = context.new_page()
-                    page.on("console", lambda msg: logger.debug(f"Browser: {msg.text}"))
+                    # Create/update tracking record
+                    create_pending_record(tracking_col, pid, image_url, style, mode)
+                    mark_processing(tracking_col, pid)
 
+                    # Download source image once (reused if account rotation retries this player)
+                    source_path = None
                     try:
-                        # Create/update tracking record
-                        create_pending_record(tracking_col, pid, image_url, style, mode)
-                        mark_processing(tracking_col, pid)
-
-                        # Download source image
                         source_path = download_player_image(image_url, output_dir, pid)
-
-                        # Generate styled image
-                        output_path = os.path.join(output_dir, f"{pid}_generated.png")
-                        run_generation_on_page(page, source_path, prompt_text, output_path, style, mode)
-
-                        # Verify output exists
-                        if not os.path.exists(output_path):
-                            raise FileNotFoundError(f"Output file not created: {output_path}")
-
-                        # Upload to DO Spaces
-                        logger.info(f"Uploading player {pid} image to DO Spaces...")
-                        spaces_url = upload_image_to_spaces(output_path, pid)
-
-                        duration = time.time() - start_time
-                        mark_completed(tracking_col, pid, output_path, round(duration, 2), spaces_url)
-
-                        # Clean up source image
-                        if os.path.exists(source_path):
-                            os.remove(source_path)
-
-                        succeeded += 1
-                        logger.info(f"Completed player {pid} in {duration:.1f}s")
-
                     except Exception as e:
-                        duration = time.time() - start_time
                         error_msg = f"{type(e).__name__}: {str(e)}"
                         mark_failed(tracking_col, pid, error_msg)
                         failed += 1
-                        logger.warning(f"Failed player {pid}: {error_msg}")
-                        try:
-                            page.screenshot(path=os.path.join(output_dir, f"{pid}_error.png"))
-                        except Exception:
-                            pass
+                        logger.warning(f"Failed player {pid} (download error): {error_msg}")
+                        continue
 
-                    finally:
-                        page.close()
+                    output_path = os.path.join(output_dir, f"{pid}_generated.png")
+
+                    # Generation loop — one attempt per available account
+                    player_succeeded = False
+                    player_failed_permanently = False
+                    for _attempt in range(account_manager.count):
+                        page = context.new_page()
+                        page.on("console", lambda msg: logger.debug(f"Browser: {msg.text}"))
+                        try:
+                            run_generation_on_page(page, source_path, prompt_text, output_path, style, mode)
+                            player_succeeded = True
+
+                        except DailyLimitReachedException:
+                            logger.warning(
+                                f"Daily limit reached on account "
+                                f"{account_manager.current['email']} — attempting rotation..."
+                            )
+                            try:
+                                page.screenshot(path=os.path.join(output_dir, f"{pid}_limit.png"))
+                            except Exception:
+                                pass
+
+                        except Exception as e:
+                            error_msg = f"{type(e).__name__}: {str(e)}"
+                            mark_failed(tracking_col, pid, error_msg)
+                            failed += 1
+                            player_failed_permanently = True
+                            logger.warning(f"Failed player {pid}: {error_msg}")
+                            try:
+                                page.screenshot(path=os.path.join(output_dir, f"{pid}_error.png"))
+                            except Exception:
+                                pass
+
+                        finally:
+                            page.close()
+
+                        if player_succeeded or player_failed_permanently:
+                            break
+
+                        # Only here on DailyLimitReachedException — rotate to next account
+                        if not account_manager.rotate():
+                            logger.error("All accounts exhausted. Stopping pipeline.")
+                            all_exhausted = True
+                            mark_failed(tracking_col, pid, "DailyLimitReachedException: All accounts exhausted")
+                            failed += 1
+                            break
+
+                        # Re-login with new account and recreate the browser context
+                        new_account = account_manager.current
+                        logger.info(f"Logging in as {new_account['email']}...")
+                        if not login_with_browser(
+                            browser,
+                            account_manager.state_path,
+                            email=new_account["email"],
+                            password=new_account["password"],
+                        ):
+                            logger.error(f"Login failed for {new_account['email']}. Stopping pipeline.")
+                            all_exhausted = True
+                            mark_failed(tracking_col, pid, f"Login failed for {new_account['email']}")
+                            failed += 1
+                            break
+
+                        context.close()
+                        context = browser.new_context(storage_state=account_manager.state_path)
+                        logger.info(f"Switched to {new_account['email']}. Retrying player {pid}...")
+
+                    if player_succeeded:
+                        try:
+                            # Verify output exists
+                            if not os.path.exists(output_path):
+                                raise FileNotFoundError(f"Output file not created: {output_path}")
+
+                            # Upload to DO Spaces
+                            logger.info(f"Uploading player {pid} image to DO Spaces...")
+                            spaces_url = upload_image_to_spaces(output_path, pid)
+
+                            duration = time.time() - start_time
+                            mark_completed(tracking_col, pid, output_path, round(duration, 2), spaces_url)
+                            succeeded += 1
+                            logger.info(f"Completed player {pid} in {duration:.1f}s")
+
+                        except Exception as e:
+                            error_msg = f"{type(e).__name__}: {str(e)}"
+                            mark_failed(tracking_col, pid, error_msg)
+                            failed += 1
+                            logger.warning(f"Failed player {pid} (post-generation): {error_msg}")
+
+                    # Clean up source image regardless of outcome
+                    if source_path and os.path.exists(source_path):
+                        os.remove(source_path)
 
             finally:
                 browser.close()
