@@ -62,7 +62,7 @@ def check_session(state_path="state.json"):
         finally:
             browser.close()
 
-def run_generation_on_page(page, image_path, prompt, output_path, style="Photo", mode="General"):
+def run_generation_on_page(page, image_path, prompt, output_path, style="Photo"):
     """
     Run image generation on an already-open Playwright page.
     Raises exceptions on failure — caller is responsible for error handling
@@ -84,39 +84,52 @@ def run_generation_on_page(page, image_path, prompt, output_path, style="Photo",
 
     # 2. Select Style Preset
     print(f"Selecting Style Preset: {style}")
-    style_locator = page.locator(f'div:text-is("{style}"), button:has-text("{style}")').first
+    # Map common styles to website values
+    style_map = {
+        "Photo": "photo",
+        "Anime": "anime",
+        "Fantasy": "fantasy",
+        "Portrait": "portrait",
+        "Landscape": "landscape",
+        "Sci-Fi": "scifi",
+        "Cinematic": "cinematic",
+        "Oil Painting": "oil",
+        "Pixel Art": "pixel",
+        "Watercolor": "watercolor",
+        "Ghibli": "ghibli",
+        "Vintage": "vintage",
+        "Raw Film": "raw-film",
+        "Ink Splash": "ink-splash"
+    }
+    style_value = style_map.get(style, style.lower())
+    
     try:
-        style_locator.wait_for(state="visible", timeout=10000)
-        style_locator.click(force=True)
+        # The style selector is a <select> element inside a label with text "Styles"
+        style_selector = 'label:has-text("Styles") select'
+        page.wait_for_selector(style_selector, timeout=10000)
+        page.select_option(style_selector, value=style_value)
     except Exception as e:
-        print(f"Warning: Failed to select {style} preset: {e}")
+        print(f"Warning: Failed to select {style} preset (value={style_value}): {e}")
         page.screenshot(path=f"debug_failed_{style}_selection.png")
 
-    # 3. Select Edit Mode
-    print(f"Selecting Edit Mode: {mode}")
-    mode_locator = page.locator(f'div:text-is("{mode}"), button:has-text("{mode}")').first
-    try:
-        mode_locator.wait_for(state="visible", timeout=10000)
-        mode_locator.click(force=True)
-    except Exception as e:
-        print(f"Warning: Failed to select {mode} edit mode: {e}")
-        page.screenshot(path=f"debug_failed_{mode}_selection.png")
-
-    # 4. Enter Prompt
+    # 3. Enter Prompt
     print(f"Entering prompt (length: {len(prompt)} chars)...")
-    textarea = page.locator('textarea')
+    # Using more specific selector for the textarea
+    textarea = page.locator('textarea[placeholder*="Describe"]')
     textarea.wait_for(state="visible")
     textarea.fill(prompt)
 
     page.screenshot(path="run_debug_2_before_apply.png")
 
-    # 5. Click Apply Edits
-    print("Clicking 'Apply Edits'...")
-    apply_button = page.locator('button:has-text("Apply Edits")')
+    # 4. Click Apply Edits / Generate
+    # The button text changes to "Edit image" after upload, or "Generate" initially.
+    # We target the primary brand button.
+    print("Clicking 'Edit image'...")
+    apply_button = page.locator('button.bg-brand-green, button:has-text("Edit image"), button:has-text("Generate")').first
     if apply_button.count() > 0:
         apply_button.click(force=True)
     else:
-        print("CRITICAL: Apply Edits button NOT FOUND!")
+        print("CRITICAL: Apply/Edit button NOT FOUND!")
         page.screenshot(path="debug_no_apply_button.png")
 
     # Check state immediately after click
@@ -127,7 +140,7 @@ def run_generation_on_page(page, image_path, prompt, output_path, style="Photo",
     # 6. Wait for Generation & Download
     print("Waiting for generation to complete...")
 
-    error_locator = page.locator('div:has-text("Edit Failed"), div:has-text("High demand right now")')
+    error_locator = page.locator('div:has-text("Edit Failed"), div:has-text("High demand right now"), div:has-text("Daily limit reached"), div:has-text("today\'s limit"), div:has-text("used all image edits")')
     download_locator = page.locator('button:has-text("Download")')
 
     start_time = time.time()
@@ -159,6 +172,8 @@ def run_generation_on_page(page, image_path, prompt, output_path, style="Photo",
 
     if not generation_success:
         page.screenshot(path="run_debug_generation_timeout.png")
+        with open("debug_generation_timeout.html", "w") as f:
+            f.write(page.content())
         raise TimeoutError("Generation timed out - neither download button nor error modal appeared in 120s")
 
     download_button = download_locator.first
@@ -185,52 +200,70 @@ def run_generation_on_page(page, image_path, prompt, output_path, style="Photo",
         modal_download = page.locator('button:has-text("Download Image"), a:has-text("Download Image"), button:has-text("Download High Res")').first
         if modal_download.count() > 0:
             print(f"Found modal option: {modal_download.evaluate('el => el.innerText')}")
-            with page.expect_download(timeout=30000) as download_info:
-                modal_download.click(force=True)
-            download = download_info.value
-            download.save_as(output_path)
-            print(f"Saved generated image (from modal) to {os.path.abspath(output_path)}")
-        else:
-            print("No modal download option found.")
+            try:
+                with page.expect_download(timeout=10000) as download_info:
+                    modal_download.click(force=True)
+                download = download_info.value
+                download.save_as(output_path)
+                print(f"Saved generated image (from modal) to {os.path.abspath(output_path)}")
+                return  # Success
+            except Exception as me:
+                print(f"Modal download also failed: {me}")
 
-            # FALLBACK: Try to find the image in the page as a base64 string or static URL
-            print("Attempting fallback: searching for base64 image data...")
-            image_elements = page.query_selector_all("img")
-            found_fallback = False
-            for img in image_elements:
-                src = img.get_attribute("src")
-                if not src:
-                    continue
+        # FALLBACK: Try to find the image in the page as a base64 string or static URL
+        print("Attempting fallback: searching for result image in the page...")
+        image_elements = page.query_selector_all("img")
+        found_fallback = False
+        
+        # We'll collect candidates and pick the best one
+        candidates = []
 
-                # Case 1: Base64
-                if src.startswith("data:image/"):
-                    if len(src) > 50000:  # >50KB
-                        print(f"Found potential result image (base64, size: {len(src)})")
-                        try:
-                            header, data = src.split(",", 1)
-                            with open(output_path, "wb") as f:
-                                f.write(base64.b64decode(data))
-                            print(f"Saved generated image from base64 string to {os.path.abspath(output_path)}")
-                            found_fallback = True
-                            break
-                        except Exception as b64e:
-                            print(f"Failed to decode base64 image: {b64e}")
+        for img in image_elements:
+            src = img.get_attribute("src")
+            if not src:
+                continue
 
-                # Case 2: Static result URL (e.g. static.seedream.pro/.../output/...)
-                elif "seedream.pro" in src and "/output/" in src:
-                    print(f"Found potential result image (URL: {src})")
-                    if download_image(src, output_path):
-                        print(f"Saved generated image from URL to {os.path.abspath(output_path)}")
+            # Case 1: Static result URL (e.g. static.seedream.pro/.../outputs/output_...)
+            # Relaxed string check to catch /outputs/ or /output/
+            if "seedream.pro" in src and "/output" in src:
+                print(f"Found potential result image URL: {src}")
+                candidates.append({"type": "url", "src": src})
+
+            # Case 2: Base64 (often used for previews or direct inline data)
+            elif src.startswith("data:image/"):
+                size_kb = len(src) / 1024
+                if size_kb > 10:  # Any image over 10KB is a candidate
+                    print(f"Found potential base64 image (size: {size_kb:.1f} KB)")
+                    candidates.append({"type": "base64", "src": src, "size": size_kb})
+
+        # Process candidates: prioritize static URLs with "output" in them
+        for candidate in candidates:
+            if candidate["type"] == "url":
+                if download_image(candidate["src"], output_path):
+                    print(f"Saved generated image from URL to {os.path.abspath(output_path)}")
+                    found_fallback = True
+                    break
+            elif candidate["type"] == "base64":
+                # Only use base64 if it's the only option or reasonably large
+                if candidate["size"] > 30 or len(candidates) == 1:
+                    try:
+                        header, data = candidate["src"].split(",", 1)
+                        with open(output_path, "wb") as f:
+                            f.write(base64.b64decode(data))
+                        print(f"Saved generated image from base64 string ({candidate['size']:.1f} KB) to {os.path.abspath(output_path)}")
                         found_fallback = True
                         break
+                    except Exception as b64e:
+                        print(f"Failed to decode base64 image: {b64e}")
 
-            if not found_fallback:
-                with open("debug_page.html", "w") as f:
-                    f.write(page.content())
-                raise e
+        if not found_fallback:
+            with open("debug_page_no_image_found.html", "w") as f:
+                f.write(page.content())
+            page.screenshot(path="debug_page_no_image_found.png")
+            raise Exception("Generation succeeded but failed to capture the result image via download or fallback.")
 
 
-def generate_image(image_path, prompt, output_path="result.png", style="Photo", mode="General"):
+def generate_image(image_path, prompt, output_path="result.png", style="Photo"):
     """
     Standalone wrapper: launches its own browser, runs generation, closes browser.
     Used when calling generate_image.py directly (CLI or single-image use).
@@ -250,7 +283,7 @@ def generate_image(image_path, prompt, output_path="result.png", style="Photo", 
         page.on("console", lambda msg: print(f"Browser Console: {msg.text}"))
 
         try:
-            run_generation_on_page(page, image_path, prompt, output_path, style, mode)
+            run_generation_on_page(page, image_path, prompt, output_path, style)
         except Exception as e:
             print(f"Error during generation: {e}")
             page.screenshot(path="run_debug_generation_error.png")
@@ -274,7 +307,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt-file", default="MASTER_PROMPT.txt", help="Path to prompt file")
     parser.add_argument("--output", default="result.png", help="Output filename")
     parser.add_argument("--style", default="Photo", help="Style preset to apply")
-    parser.add_argument("--mode", default="General", help="Edit mode to use")
+    parser.add_argument("--style", default="Photo", help="Style preset to apply")
 
     args = parser.parse_args()
 
@@ -285,13 +318,13 @@ if __name__ == "__main__":
 
     if args.file:
         if os.path.exists(args.file):
-            generate_image(args.file, prompt_text, args.output, args.style, args.mode)
+            generate_image(args.file, prompt_text, args.output, args.style)
         else:
             print(f"Error: File {args.file} not found.")
     elif args.url:
         temp_image = "temp_input.png"
         if download_image(args.url, temp_image):
-            generate_image(temp_image, prompt_text, args.output, args.style, args.mode)
+            generate_image(temp_image, prompt_text, args.output, args.style)
             if os.path.exists(temp_image):
                 os.remove(temp_image)
     else:

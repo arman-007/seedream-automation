@@ -32,7 +32,6 @@ def run_pipeline(
     player_ids=None,
     custom_filter=None,
     style="Photo",
-    mode="General",
     prompt_file="MASTER_PROMPT.txt",
     output_dir=None,
     max_retries=3,
@@ -123,10 +122,18 @@ def run_pipeline(
             # Filter out completed and failed — failed only retry via --retry-failed
             completed_ids = get_completed_player_ids(tracking_col)
             failed_ids = get_failed_player_ids(tracking_col)
-            skip_ids = completed_ids | failed_ids
-            work_list = [p for p in players if p.get("api_player_id") not in skip_ids]
-            skipped_completed = len([p for p in players if p.get("api_player_id") in completed_ids])
-            skipped_failed = len([p for p in players if p.get("api_player_id") in failed_ids])
+
+            if player_ids:
+                # If specific IDs are provided, only skip completed ones
+                work_list = [p for p in players if p.get("api_player_id") not in completed_ids]
+                skipped_completed = len([p for p in players if p.get("api_player_id") in completed_ids])
+                skipped_failed = 0
+            else:
+                skip_ids = completed_ids | failed_ids
+                work_list = [p for p in players if p.get("api_player_id") not in skip_ids]
+                skipped_completed = len([p for p in players if p.get("api_player_id") in completed_ids])
+                skipped_failed = len([p for p in players if p.get("api_player_id") in failed_ids])
+            
             skipped = skipped_completed + skipped_failed
 
         # 3. Filter out players with no image URL
@@ -180,7 +187,7 @@ def run_pipeline(
                     start_time = time.time()
 
                     # Create/update tracking record
-                    create_pending_record(tracking_col, pid, image_url, style, mode)
+                    create_pending_record(tracking_col, pid, image_url, style)
                     mark_processing(tracking_col, pid)
 
                     # Download source image once (reused if account rotation retries this player)
@@ -203,7 +210,7 @@ def run_pipeline(
                         page = context.new_page()
                         page.on("console", lambda msg: logger.debug(f"Browser: {msg.text}"))
                         try:
-                            run_generation_on_page(page, source_path, prompt_text, output_path, style, mode)
+                            run_generation_on_page(page, source_path, prompt_text, output_path, style)
                             player_succeeded = True
 
                         except DailyLimitReachedException:
