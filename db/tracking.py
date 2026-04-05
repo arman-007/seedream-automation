@@ -44,7 +44,7 @@ def get_failed_player_ids(collection):
     return {doc["api_player_id"] for doc in cursor}
 
 
-def create_pending_record(collection, api_player_id, source_image_url, style, mode):
+def create_pending_record(collection, api_player_id, source_image_url, style):
     """
     Insert or update a tracking document to 'pending' status.
     Uses upsert on api_player_id so reruns are idempotent.
@@ -57,7 +57,6 @@ def create_pending_record(collection, api_player_id, source_image_url, style, mo
                 "status": STATUS_PENDING,
                 "source_image_url": source_image_url,
                 "style": style,
-                "mode": mode,
                 "updated_at": now,
             },
             "$setOnInsert": {

@@ -11,14 +11,16 @@ MongoDB (players) ──> Pipeline Runner ──> Seedream.pro (AI editor) ─�
 ```
 
 1. **Source**: Player data lives in a MongoDB database (`Fantasy_Global_Livescore.players`). Each document has an `api_player_id` and an `image` URL pointing to a headshot photo.
-2. **Session**: The pipeline checks if the Seedream session is valid before starting. If expired, it logs in automatically using `EMAIL`/`PASSWORD` from `.env` and saves a fresh session.
+2. **Session**: The pipeline checks if the Seedream session is valid before starting. If expired, it logs in automatically using the configured account credentials from `.env` and saves a fresh session (`state_0.json`).
 3. **Pipeline**: The runner fetches unprocessed players, downloads each source image, uploads it to Seedream's AI photo editor via headless Chromium, applies the stylization prompt, and waits for generation to complete.
-4. **Upload**: Generated portraits are uploaded to DigitalOcean Spaces (`image_pipeline/{api_player_id}.png`) and the CDN URL is stored in the tracking record.
-5. **Tracking**: A separate MongoDB database records the status of every player — `pending`, `processing`, `completed`, or `failed` — along with error logs, retry counts, duration, and the Spaces CDN URL.
+4. **Account rotation**: When an account hits Seedream's daily generation limit, the pipeline automatically rotates to the next configured account, re-logs in, and retries the current player — no manual intervention needed.
+5. **Upload**: Generated portraits are uploaded to DigitalOcean Spaces (`image_pipeline/{api_player_id}.png`) and the CDN URL is stored in the tracking record.
+6. **Tracking**: A separate MongoDB database records the status of every player — `pending`, `processing`, `completed`, or `failed` — along with error logs, retry counts, duration, and the Spaces CDN URL.
 
 ## Features
 
 - **Fully Unattended**: Runs headless end-to-end with no manual steps. Auto-login refreshes expired sessions automatically.
+- **Multi-Account Rotation**: Supports unlimited Seedream accounts. When one account hits its daily generation limit, the pipeline automatically rotates to the next account and continues without stopping.
 - **Browser Reuse**: One browser instance is shared across the entire batch — no per-player launch overhead.
 - **Safe Restart**: Completed players are always skipped. Players stuck in `processing` from a crashed run are automatically reset on startup.
 - **Explicit Retry**: Failed players are excluded from normal runs and only re-processed when you explicitly pass `--retry-failed`.
@@ -34,15 +36,18 @@ MongoDB (players) ──> Pipeline Runner ──> Seedream.pro (AI editor) ─�
 seedream-automation/
 ├── run_pipeline.py            # CLI entry point
 ├── generate_image.py          # Playwright automation for Seedream.pro
-│                              #   check_session()         — validates saved session
-│                              #   run_generation_on_page() — generation on open page
-│                              #   generate_image()         — standalone single-image wrapper
-├── login_helper.py            # Headless login, saves state.json
+│                              #   check_session()              — validates saved session
+│                              #   run_generation_on_page()     — generation on open page
+│                              #   generate_image()             — standalone single-image wrapper
+│                              #   DailyLimitReachedException   — raised on daily limit hit
+├── accounts.py                # Multi-account manager (AccountManager)
+├── login_helper.py            # Headless login, saves session file
 ├── verify_login.py            # Check if saved session is valid
 ├── MASTER_PROMPT.txt          # AI stylization prompt applied to every generation
 ├── .env                       # Credentials and config (gitignored)
 ├── .env.example               # Template for .env
-├── state.json                 # Saved browser session (gitignored)
+├── state_0.json               # Saved session for account 1 (gitignored)
+├── state_1.json               # Saved session for account 2 (gitignored, created on rotation)
 ├── requirements.txt           # Python dependencies
 ├── db/
 │   ├── connection.py          # MongoDB connection factory (retry logic)
@@ -88,9 +93,15 @@ cp .env.example .env
 Edit `.env` with your values:
 
 ```env
-# Seedream credentials (used for headless auto-login)
-EMAIL=your-email@example.com
-PASSWORD=your-password
+# Seedream accounts — add as many as needed.
+# When account 1 hits its daily generation limit, the pipeline automatically
+# rotates to account 2, then 3, and so on.
+ACCOUNT_1_EMAIL=your-primary-email@example.com
+ACCOUNT_1_PASSWORD=your-primary-password
+ACCOUNT_2_EMAIL=your-secondary-email@example.com
+ACCOUNT_2_PASSWORD=your-secondary-password
+# ACCOUNT_3_EMAIL=...
+# ACCOUNT_3_PASSWORD=...
 
 # Source database (player data)
 SOURCE_DB_URL=mongodb://localhost:27017
@@ -120,11 +131,12 @@ For the tracking database, credentials can be embedded directly in the URL (`mon
 
 ### 5. Session
 
-The pipeline handles session management automatically. On first run (or after expiry), it logs in headlessly using `EMAIL`/`PASSWORD` from `.env` and saves `state.json`. No manual browser interaction is required.
+The pipeline handles session management automatically. On first run (or after expiry), it logs in headlessly using account 1's credentials from `.env` and saves `state_0.json`. When account rotation occurs, additional session files (`state_1.json`, `state_2.json`, ...) are created automatically. No manual browser interaction is required.
 
-To login or re-login manually:
+To login manually with the primary account:
 
 ```bash
+source venv/bin/activate
 python login_helper.py
 ```
 
@@ -356,7 +368,10 @@ Edit this file to change the visual style applied to all future generations.
 ## Troubleshooting
 
 **Session expired**
-Handled automatically — the pipeline logs in headlessly at startup if `state.json` is missing or expired. If auto-login fails, check `EMAIL`/`PASSWORD` in `.env` and look at `debug_login_failed.png`.
+Handled automatically — the pipeline logs in headlessly at startup if the session file is missing or expired. If auto-login fails, check `ACCOUNT_1_EMAIL` / `ACCOUNT_1_PASSWORD` in `.env` and look at `debug_login_failed.png`.
+
+**Daily generation limit reached**
+When an account hits Seedream's daily limit, the pipeline automatically rotates to the next account in `.env` (`ACCOUNT_2_EMAIL`, etc.) and continues. If all accounts are exhausted, the pipeline logs an error and stops gracefully. Add more accounts to `.env` to extend capacity.
 
 **High demand errors from Seedream**
 Seedream occasionally returns "High demand right now" errors. Affected players are marked `failed`. Run `python run_pipeline.py --retry-failed` once demand eases.

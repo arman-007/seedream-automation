@@ -28,10 +28,6 @@ def main():
         help="Style preset (default: Photo)",
     )
     parser.add_argument(
-        "--mode", default="General",
-        help="Edit mode (default: General)",
-    )
-    parser.add_argument(
         "--prompt-file", default="MASTER_PROMPT.txt",
         help="Path to prompt file",
     )
@@ -81,7 +77,6 @@ def main():
         player_ids=player_ids,
         custom_filter=custom_filter,
         style=args.style,
-        mode=args.mode,
         prompt_file=args.prompt_file,
         output_dir=args.output_dir,
         max_retries=args.max_retries,
